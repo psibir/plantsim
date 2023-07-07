@@ -11,79 +11,63 @@ class PlantSimulation:
 
         self.buffer_state = queue.Queue()
         self.cart_state = queue.SimpleQueue()
-        self.completed_products = collections.Counter()
+        self.completed_products = collections.defaultdict(int)
 
         self.lock = threading.Lock()
-        self.log_file = open("log.txt", "w")
 
         self.m = m  # Number of Part Workers
         self.n = n  # Number of Product Workers
 
+    def __enter__(self):
+        self.log_file = open("log.txt", "w")
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.log_file.close()
+
     def log_info(self, worker_type, worker_id, action):
         self.log_file.write(f"{worker_type} {worker_id}: {action}\n")
 
-    def part_worker(self, worker_id):
+    def worker(self, worker_id, worker_type):
         for _ in range(5):
-            load_order = self.generate_load_order()
-            self.log_info("Part Worker", worker_id, f"Generating load order: {load_order}")
+            if worker_type == "Part":
+                order = self.generate_load_order()
+                action_template = "Generating load order: {}"
+                process_order_fn = self.process_load_order
+            else:
+                order = self.generate_pickup_order()
+                action_template = "Generating pickup order: {}"
+                process_order_fn = self.process_pickup_order
+
+            self.log_info(worker_type + " Worker", worker_id, action_template.format(order))
 
             while True:
                 with self.lock:
-                    if self.is_load_order_possible(load_order):
-                        self.load_parts_to_buffer(load_order)
-                        self.log_info("Part Worker", worker_id, f"Loaded parts to buffer: {load_order}")
+                    if self.is_order_possible(order):
+                        self.load_parts_to_buffer(order)
+                        self.log_info(worker_type + " Worker", worker_id, f"Loaded parts to buffer: {order}")
                         break
                     else:
-                        self.log_info("Part Worker", worker_id, "Waiting for buffer space")
+                        self.log_info(worker_type + " Worker", worker_id, "Waiting for required parts")
 
                 if random.randint(0, 1):
                     self.move_parts_back_to_buffer()
 
-            time_taken = self.move_parts_to_cart(load_order)
-            self.log_info("Part Worker", worker_id, f"Moved parts to cart: {load_order}")
-            self.process_load_order(worker_id, time_taken)
-
-    def product_worker(self, worker_id):
-        for _ in range(5):
-            pickup_order = self.generate_pickup_order()
-            self.log_info("Product Worker", worker_id, f"Generating pickup order: {pickup_order}")
-
-            while True:
-                with self.lock:
-                    if self.is_pickup_order_possible(pickup_order):
-                        self.pickup_parts_from_buffer(pickup_order)
-                        self.log_info("Product Worker", worker_id, f"Picked up parts from buffer: {pickup_order}")
-                        break
-                    else:
-                        self.log_info("Product Worker", worker_id, "Waiting for required parts")
-
-                if random.randint(0, 1):
-                    self.move_parts_back_to_buffer()
-
-            time_taken = self.move_parts_to_assembly_area(pickup_order)
-            self.log_info("Product Worker", worker_id, f"Moved parts to assembly area: {pickup_order}")
-            self.process_pickup_order(worker_id, time_taken)
+            time_taken = self.move_parts(order, worker_type)
+            self.log_info(worker_type + " Worker", worker_id, f"Moved parts: {order}")
+            process_order_fn(worker_id, time_taken)
 
     def generate_load_order(self):
         return [random.randint(0, 5) for _ in range(5)]
 
     def generate_pickup_order(self):
-        a_count = random.randint(0, 3)
-        b_count = random.randint(0, 3 - a_count)
-        c_count = random.randint(0, 3 - a_count - b_count)
-        d_count = random.randint(0, 3 - a_count - b_count - c_count)
-        e_count = random.randint(0, 3 - a_count - b_count - c_count - d_count)
+        return [random.randint(0, 3) for _ in range(5)]
 
-        return [a_count, b_count, c_count, d_count, e_count]
+    def is_order_possible(self, order):
+        return all(part_count <= buffer_count for part_count, buffer_count in zip(order, self.buffer_state.queue))
 
-    def is_load_order_possible(self, load_order):
-        for part_count, buffer_count in zip(load_order, self.buffer_state.queue):
-            if part_count > buffer_count:
-                return False
-        return True
-
-    def load_parts_to_buffer(self, load_order):
-        for part_count in load_order:
+    def load_parts_to_buffer(self, order):
+        for part_count in order:
             self.buffer_state.put(part_count)
 
     def move_parts_back_to_buffer(self):
@@ -91,9 +75,13 @@ class PlantSimulation:
             part_count = self.cart_state.get()
             self.buffer_state.put(part_count)
 
-    def move_parts_to_cart(self, load_order):
-        time_taken = sum(part_count * time for part_count, time in zip(load_order, [500, 500, 600, 600, 700]))
-        for part_count in load_order:
+    def move_parts(self, order, worker_type):
+        time_per_part = {
+            "Part": [500, 500, 600, 600, 700],
+            "Product": [200, 200, 300, 300, 400]
+        }
+        time_taken = sum(part_count * time for part_count, time in zip(order, time_per_part[worker_type]))
+        for part_count in order:
             self.buffer_state.get()
             self.cart_state.put(part_count)
         return time_taken
@@ -107,22 +95,6 @@ class PlantSimulation:
                 self.completed_products[worker_id] += 1
                 self.log_info("Part Worker", worker_id, f"Load order completed. Total completed products: {self.completed_products[worker_id]}")
 
-    def is_pickup_order_possible(self, pickup_order):
-        for part_count, buffer_count in zip(pickup_order, self.buffer_state.queue):
-            if part_count > buffer_count:
-                return False
-        return True
-
-    def pickup_parts_from_buffer(self, pickup_order):
-        for part_count in pickup_order:
-            self.buffer_state.get()
-
-    def move_parts_to_assembly_area(self, pickup_order):
-        time_taken = sum(part_count * time for part_count, time in zip(pickup_order, [200, 200, 300, 300, 400]))
-        for part_count in pickup_order:
-            self.cart_state.get()
-        return time_taken
-
     def process_pickup_order(self, worker_id, time_taken):
         if time_taken > self.MaxTimeProduct:
             self.log_info("Product Worker", worker_id, "Timeout! Generating new pickup order.")
@@ -132,16 +104,14 @@ class PlantSimulation:
 
     def run_simulation(self):
         with ThreadPoolExecutor(max_workers=self.m + self.n) as executor:
-            part_workers = [executor.submit(self.part_worker, worker_id) for worker_id in range(1, self.m + 1)]
-            product_workers = [executor.submit(self.product_worker, worker_id) for worker_id in range(1, self.n + 1)]
+            workers = [executor.submit(self.worker, worker_id, "Part") for worker_id in range(1, self.m + 1)] + [executor.submit(self.worker, worker_id, "Product") for worker_id in range(1, self.n + 1)]
 
-            for worker in part_workers + product_workers:
+            for worker in workers:
                 worker.result()
 
         self.log_info("Finish!", "", "")
-        self.log_file.close()
         print("Finish!")
 
 if __name__ == "__main__":
-    plant_simulation = PlantSimulation(m=20, n=16)
-    plant_simulation.run_simulation()
+    with PlantSimulation(m=20, n=16) as plant_simulation:
+        plant_simulation.run_simulation()
